@@ -1,41 +1,95 @@
 import io
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from rapidfuzz import fuzz, process
+from rapidfuzz import fuzz
 
 APP_TITLE = "Nauruan Health Vocabulary Lookup & Validation MVP"
-DATA_PATH = "data/health_lookup_records.csv"
+APP_DIR = Path(__file__).resolve().parent
+DATA_CANDIDATES = [
+    APP_DIR / "data" / "health_lookup_records.csv",
+    APP_DIR / "health_lookup_records.csv",
+    Path.cwd() / "data" / "health_lookup_records.csv",
+    Path.cwd() / "health_lookup_records.csv",
+]
+
+REQUIRED_COLUMNS = [
+    "record_type", "record_id", "category", "subdomain", "priority", "english",
+    "plain_language_use", "nauruan", "source_id", "source_title", "pdf_page",
+    "dictionary_page", "source_url", "status", "clinical_safety_flag",
+    "evidence_note", "notes", "english_norm", "nauruan_norm",
+]
 
 st.set_page_config(page_title="Nauruan Health Lookup", page_icon="🏥", layout="wide")
 
-@st.cache_data
-def load_data():
-    df = pd.read_csv(DATA_PATH)
-    df = df.copy()
-    for col in df.columns:
-        if df[col].dtype == object:
-            df[col] = df[col].fillna("")
-    df["has_candidate"] = df["nauruan"].astype(str).str.strip().ne("")
-    df["search_blob"] = (
-        df["english"].astype(str) + " " +
-        df["nauruan"].astype(str) + " " +
-        df["category"].astype(str) + " " +
-        df["plain_language_use"].astype(str)
-    ).str.lower()
-    return df
 
 def norm(text):
-    text = str(text or "").lower().strip()
+    """Normalize values safely for search. Handles None, NaN, numbers, and strings."""
+    if text is None:
+        return ""
+    text = str(text).lower().strip()
+    if text in {"nan", "none", "nat"}:
+        return ""
     text = re.sub(r"[^a-z0-9\s'-]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def find_data_file():
+    for path in DATA_CANDIDATES:
+        if path.exists():
+            return path
+    return None
+
+
+@st.cache_data
+def load_data():
+    data_path = find_data_file()
+    if data_path is None:
+        visible_files = []
+        for p in APP_DIR.rglob("*"):
+            if p.is_file():
+                visible_files.append(str(p.relative_to(APP_DIR)))
+        st.error(
+            "Data file not found. Upload health_lookup_records.csv either in a data/ folder "
+            "or in the same folder as app.py, then redeploy the app."
+        )
+        st.code("Expected one of:\n" + "\n".join(str(p) for p in DATA_CANDIDATES), language="text")
+        st.code("Files currently visible to the app:\n" + ("\n".join(visible_files) or "No files found"), language="text")
+        st.stop()
+
+    # Critical fix: read every column as text and prevent blank cells becoming NaN floats.
+    df = pd.read_csv(data_path, dtype=str, keep_default_na=False).fillna("")
+    df = df.copy()
+
+    # Defensive: if a future CSV lacks a column, create it rather than crashing.
+    for col in REQUIRED_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Strip whitespace safely.
+    for col in df.columns:
+        df[col] = df[col].map(lambda x: "" if x is None else str(x).strip())
+
+    df["has_candidate"] = df["nauruan"].map(norm).ne("")
+    df["search_blob"] = df.apply(
+        lambda r: " ".join(
+            norm(r.get(c, ""))
+            for c in ["english", "nauruan", "category", "subdomain", "plain_language_use", "notes"]
+        ),
+        axis=1,
+    )
+    df.attrs["data_path"] = str(data_path)
+    return df
+
 
 def search_records(df, query, direction="English → Nauruan", limit=10):
     q = norm(query)
     if not q:
         return pd.DataFrame()
+
     candidates = df[df["has_candidate"]].copy()
     if direction == "English → Nauruan":
         key_col = "english"
@@ -43,15 +97,16 @@ def search_records(df, query, direction="English → Nauruan", limit=10):
         key_col = "nauruan"
     else:
         key_col = "search_blob"
-    # Score exact/contains/fuzzy matches.
+
     rows = []
     for _, row in candidates.iterrows():
         target = norm(row.get(key_col, ""))
-        blob = row.get("search_blob", "")
+        blob = norm(row.get("search_blob", ""))
         score = 0
+
         if target == q:
             score = 100
-        elif q in target or q in blob:
+        elif (target and q in target) or (blob and q in blob):
             score = 92
         else:
             score = max(
@@ -59,18 +114,25 @@ def search_records(df, query, direction="English → Nauruan", limit=10):
                 fuzz.partial_ratio(q, target),
                 fuzz.token_set_ratio(q, blob),
             )
+
         if score >= 55:
             out = row.to_dict()
             out["match_score"] = int(score)
             rows.append(out)
+
     if not rows:
         return pd.DataFrame()
-    results = pd.DataFrame(rows).sort_values(["match_score", "priority"], ascending=[False, True])
-    return results.head(limit)
+
+    results = pd.DataFrame(rows)
+    if "priority" not in results.columns:
+        results["priority"] = ""
+    return results.sort_values(["match_score", "priority"], ascending=[False, True]).head(limit)
+
 
 def init_state():
     if "review_log" not in st.session_state:
         st.session_state.review_log = []
+
 
 init_state()
 df = load_data()
@@ -90,6 +152,8 @@ with st.sidebar:
     st.write("Records loaded:", len(df))
     st.write("Candidate translations:", int(df["has_candidate"].sum()))
     st.write("Backlog/no candidate:", int((~df["has_candidate"]).sum()))
+    with st.expander("Debug: data file"):
+        st.code(df.attrs.get("data_path", "Unknown"), language="text")
 
 lookup_tab, review_tab, backlog_tab, export_tab, about_tab = st.tabs([
     "Lookup", "Validate", "Backlog", "Export feedback", "About"
@@ -134,10 +198,10 @@ with review_tab:
     candidates = df[df["has_candidate"]].copy()
     f1, f2, f3 = st.columns(3)
     with f1:
-        categories = ["All"] + sorted([x for x in candidates["category"].unique() if x])
+        categories = ["All"] + sorted([str(x) for x in candidates["category"].unique() if str(x).strip()])
         selected_category = st.selectbox("Category", categories)
     with f2:
-        priorities = ["All"] + sorted([x for x in candidates["priority"].unique() if x])
+        priorities = ["All"] + sorted([str(x) for x in candidates["priority"].unique() if str(x).strip()])
         selected_priority = st.selectbox("Priority", priorities)
     with f3:
         safety_filter = st.selectbox("Safety flag", ["All", "Safety critical", "Routine"])
@@ -215,11 +279,8 @@ with backlog_tab:
     backlog = df[~df["has_candidate"]].copy()
     st.write(f"Backlog records: {len(backlog)}")
     if not backlog.empty:
-        st.dataframe(
-            backlog[["record_id", "record_type", "category", "priority", "english", "evidence_note", "notes"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+        display_cols = [c for c in ["record_id", "record_type", "category", "priority", "english", "evidence_note", "notes"] if c in backlog.columns]
+        st.dataframe(backlog[display_cols], use_container_width=True, hide_index=True)
 
 with export_tab:
     st.subheader("Export reviewer feedback")
